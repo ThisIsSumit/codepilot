@@ -1,0 +1,130 @@
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/codepilot/backend/internal/db"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	jobQueue     = "codepilot:jobs"
+	processingQ  = "codepilot:processing"
+	jobTTL       = 24 * time.Hour
+	pollInterval = 2 * time.Second
+)
+
+// Queue wraps Redis and exposes job operations.
+type Queue struct {
+	client *redis.Client
+}
+
+// PRJob is the payload pushed to Redis for each PR to review.
+type PRJob struct {
+	ReviewID     int    `json:"review_id"`
+	RepoFullName string `json:"repo_full_name"`
+	PRNumber     int    `json:"pr_number"`
+	PRTitle      string `json:"pr_title"`
+	PRAuthor     string `json:"pr_author"`
+	PRUrl        string `json:"pr_url"`
+	DiffURL      string `json:"diff_url"`
+	InstallID    int64  `json:"install_id"`
+	EnqueuedAt   string `json:"enqueued_at"`
+}
+
+func New(redisURL string) (*Queue, error) {
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse redis url: %w", err)
+	}
+
+	client := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis ping: %w", err)
+	}
+	log.Println("Redis connected")
+	return &Queue{client: client}, nil
+}
+
+func (q *Queue) Close() error {
+	return q.client.Close()
+}
+
+// Enqueue pushes a PRJob onto the queue. It stores the job payload as JSON
+// in a Redis list (LPUSH). The worker BRPOPs from the other end.
+func (q *Queue) Enqueue(ctx context.Context, job PRJob) error {
+	job.EnqueuedAt = time.Now().UTC().Format(time.RFC3339)
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("marshal job: %w", err)
+	}
+	return q.client.LPush(ctx, jobQueue, payload).Err()
+}
+
+// QueueDepth returns how many jobs are waiting.
+func (q *Queue) QueueDepth(ctx context.Context) (int64, error) {
+	return q.client.LLen(ctx, jobQueue).Result()
+}
+
+// StartWorker runs a blocking loop that processes jobs one at a time.
+// It uses a reliable queue pattern: BRPOPLPUSH moves the job to a
+// "processing" list before handling, so a crash can be recovered.
+func (q *Queue) StartWorker(ctx context.Context, database *db.DB) {
+	log.Println("Worker started — polling for jobs...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Worker shutting down")
+			return
+		default:
+		}
+
+		// Blocking pop with 2s timeout so we respect context cancellation
+		result, err := q.client.BRPopLPush(ctx, jobQueue, processingQ,
+			pollInterval).Result()
+
+		if err == redis.Nil {
+			// No jobs available, loop again
+			continue
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Worker BRPOPLPUSH error: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		var job PRJob
+		if err := json.Unmarshal([]byte(result), &job); err != nil {
+			log.Printf("Worker: malformed job payload: %v", err)
+			q.removeFromProcessing(ctx, result)
+			continue
+		}
+
+		log.Printf("Worker: processing review_id=%d repo=%s PR#%d",
+			job.ReviewID, job.RepoFullName, job.PRNumber)
+
+		processJob(ctx, database, job)
+
+		// Remove from processing queue after successful handling
+		q.removeFromProcessing(ctx, result)
+	}
+}
+
+// removeFromProcessing removes a job from the reliable processing list.
+func (q *Queue) removeFromProcessing(ctx context.Context, payload string) {
+	q.client.LRem(ctx, processingQ, 1, payload)
+}

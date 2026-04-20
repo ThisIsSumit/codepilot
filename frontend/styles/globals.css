@@ -1,0 +1,121 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* ── Surfaces ─────────────────────────────────────────────────────────── */
+  --void:       #080b0f;
+  --surface:    #0d1117;
+  --surface-2:  #161b22;
+  --surface-3:  #1c2128;
+
+  /* ── Borders ──────────────────────────────────────────────────────────── */
+  --border:         rgba(255, 255, 255, 0.06);
+  --border-hover:   rgba(255, 255, 255, 0.10);
+  --border-active:  rgba(99, 210, 255, 0.25);
+
+  /* ── Signals ──────────────────────────────────────────────────────────── */
+  --signal:      #63d2ff;
+  --signal-dim:  rgba(99, 210, 255, 0.12);
+  --signal-glow: rgba(99, 210, 255, 0.08);
+
+  /* ── Severity ─────────────────────────────────────────────────────────── */
+  --critical: #ff5f57;
+  --warning:  #ffbd2e;
+  --info:     #1afa9b;
+  --none:     #4a5568;
+
+  /* ── Text ─────────────────────────────────────────────────────────────── */
+  --text-primary:   #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted:     #484f58;
+
+  /* ── Typography ───────────────────────────────────────────────────────── */
+  --font-display: 'Syne', sans-serif;
+  --font-mono:    'JetBrains Mono', monospace;
+
+  /* ── Spacing ──────────────────────────────────────────────────────────── */
+  --space: 4px;
+  --radius: 3px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  background: var(--void);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar        { width: 4px; height: 4px; }
+::-webkit-scrollbar-track  { background: var(--void); }
+::-webkit-scrollbar-thumb  { background: var(--border-hover); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Selection ──────────────────────────────────────────────────────────── */
+::selection {
+  background: var(--signal-dim);
+  color: var(--signal);
+}
+
+/* ── Wire border utility ────────────────────────────────────────────────── */
+.wire {
+  border: 0.5px solid var(--border);
+}
+.wire-hover:hover {
+  border-color: var(--border-hover);
+}
+.wire-active {
+  border-color: var(--border-active) !important;
+}
+
+/* ── Glow ───────────────────────────────────────────────────────────────── */
+.signal-glow {
+  box-shadow: 0 0 20px var(--signal-glow), 0 0 1px var(--border-active);
+}
+
+/* ── Pulse animation for processing state ───────────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.pulse { animation: pulse-dot 1.4s ease-in-out infinite; }
+
+/* ── Fade-in ────────────────────────────────────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fade-in 0.2s ease-out forwards; }
+
+/* ── Skeleton shimmer ───────────────────────────────────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface) 25%,
+    var(--surface-2) 50%,
+    var(--surface) 75%
+  );
+  background-size: 800px 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: var(--radius);
+}
+
+/* ── Mono utility ───────────────────────────────────────────────────────── */
+.mono { font-family: var(--font-mono); }
