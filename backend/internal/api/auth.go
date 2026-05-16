@@ -2,7 +2,11 @@ package api
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -132,13 +136,168 @@ func (h *Handler) authSignOut(c *gin.Context) {
 }
 
 func (h *Handler) authGitHub(c *gin.Context) {
-	if url := strings.TrimSpace(os.Getenv("GITHUB_OAUTH_URL")); url != "" {
-		c.Redirect(http.StatusTemporaryRedirect, url)
+	// Allow overriding full URL (convenience for deploys)
+	if u := strings.TrimSpace(os.Getenv("GITHUB_OAUTH_URL")); u != "" {
+		c.Redirect(http.StatusTemporaryRedirect, u)
 		return
 	}
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error": "github oauth is not configured",
-	})
+
+	clientID := strings.TrimSpace(os.Getenv("GITHUB_CLIENT_ID"))
+	if clientID == "" {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "github oauth not configured"})
+		return
+	}
+
+	redirect := strings.TrimSpace(os.Getenv("GITHUB_REDIRECT_URL"))
+	if redirect == "" {
+		backend := strings.TrimSpace(os.Getenv("BACKEND_ORIGIN"))
+		if backend == "" {
+			backend = "http://localhost:8080"
+		}
+		redirect = backend + "/api/v1/auth/github/callback"
+	}
+
+	authURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=%s&allow_signup=true",
+		url.QueryEscape(clientID), url.QueryEscape(redirect), url.QueryEscape("user:email"))
+	c.Redirect(http.StatusTemporaryRedirect, authURL)
+}
+
+// authGitHubCallback handles the OAuth callback, exchanges code for token, fetches
+// the GitHub user, upserts into DB and signs a session cookie before redirecting.
+func (h *Handler) authGitHubCallback(c *gin.Context) {
+	code := c.Query("code")
+	if strings.TrimSpace(code) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing code"})
+		return
+	}
+
+	clientID := strings.TrimSpace(os.Getenv("GITHUB_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GITHUB_CLIENT_SECRET"))
+	if clientID == "" || clientSecret == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "github client not configured"})
+		return
+	}
+
+	// Exchange code for access token
+	tokenURL := "https://github.com/login/oauth/access_token"
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("code", code)
+	if redirect := strings.TrimSpace(os.Getenv("GITHUB_REDIRECT_URL")); redirect != "" {
+		data.Set("redirect_uri", redirect)
+	}
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "token request failed"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "token exchange failed"})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var tokResp struct {
+		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
+		TokenType   string `json:"token_type"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &tokResp); err != nil || tokResp.AccessToken == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid token response"})
+		return
+	}
+
+	// Fetch GitHub user
+	userReq, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+	userReq.Header.Set("Authorization", "token "+tokResp.AccessToken)
+	userReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	userResp, err := client.Do(userReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not fetch github user"})
+		return
+	}
+	defer userResp.Body.Close()
+	ubody, _ := io.ReadAll(userResp.Body)
+	var gu struct {
+		ID        int64  `json:"id"`
+		Login     string `json:"login"`
+		Name      string `json:"name"`
+		Email     string `json:"email"`
+		AvatarURL string `json:"avatar_url"`
+	}
+	if err := json.Unmarshal(ubody, &gu); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid github user response"})
+		return
+	}
+
+	email := strings.TrimSpace(gu.Email)
+	// If email not public, query /user/emails
+	if email == "" {
+		emailsReq, _ := http.NewRequest("GET", "https://api.github.com/user/emails", nil)
+		emailsReq.Header.Set("Authorization", "token "+tokResp.AccessToken)
+		emailsReq.Header.Set("Accept", "application/vnd.github.v3+json")
+		eresp, err := client.Do(emailsReq)
+		if err == nil {
+			defer eresp.Body.Close()
+			eb, _ := io.ReadAll(eresp.Body)
+			var emails []struct {
+				Email      string `json:"email"`
+				Primary    bool   `json:"primary"`
+				Verified   bool   `json:"verified"`
+				Visibility string `json:"visibility"`
+			}
+			if json.Unmarshal(eb, &emails) == nil {
+				for _, e := range emails {
+					if e.Primary && e.Verified {
+						email = e.Email
+						break
+					}
+				}
+				if email == "" && len(emails) > 0 {
+					email = emails[0].Email
+				}
+			}
+		}
+	}
+
+	if email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email not available from github"})
+		return
+	}
+
+	name := strings.TrimSpace(gu.Name)
+	if name == "" {
+		name = gu.Login
+	}
+
+	user, err := h.db.UpsertUserFromGitHub(name, strings.ToLower(email), gu.Login, gu.AvatarURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+
+	tokenStr, expiry, err := h.signSessionToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create session"})
+		return
+	}
+	h.setSessionCookie(c, tokenStr, expiry)
+
+	// Redirect user to frontend dashboard with cookie set
+	frontend := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	if frontend == "" {
+		frontend = "http://localhost:3000"
+	}
+	c.Redirect(http.StatusSeeOther, frontend+"/dashboard")
 }
 
 func (h *Handler) requireAuth() gin.HandlerFunc {

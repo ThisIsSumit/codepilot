@@ -39,6 +39,7 @@ func NewRouter(database *db.DB, q *queue.Queue) *gin.Engine {
 		v1.GET("/auth/session", h.authSession)
 		v1.POST("/auth/signout", h.authSignOut)
 		v1.GET("/auth/github", h.authGitHub)
+		v1.GET("/auth/github/callback", h.authGitHubCallback)
 
 		// Webhooks
 		v1.POST("/webhooks/github", h.handleGitHubWebhook)

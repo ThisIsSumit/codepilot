@@ -187,6 +187,31 @@ func (d *DB) GetUserByID(id int) (*User, error) {
 	return &u, nil
 }
 
+// UpsertUserFromGitHub inserts or updates a user based on their email from GitHub OAuth.
+func (d *DB) UpsertUserFromGitHub(name, email, githubUsername, avatarURL string) (*User, error) {
+	row := d.QueryRow(`
+		INSERT INTO users (name, email, github_username, avatar_url, plan, api_key,
+			notification_email, notification_slack, notification_weekly_digest, password_hash)
+		VALUES ($1, $2, $3, $4, 'Pro', '', true, false, true, '')
+		ON CONFLICT (email) DO UPDATE
+		  SET name = EXCLUDED.name,
+			  github_username = EXCLUDED.github_username,
+			  avatar_url = EXCLUDED.avatar_url,
+			  updated_at = NOW()
+		RETURNING id, name, email, github_username, avatar_url, plan, api_key,
+			notification_email, notification_slack, notification_weekly_digest, password_hash, created_at
+	`, name, email, githubUsername, avatarURL)
+
+	var u User
+	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.GitHubUsername, &u.AvatarURL, &u.Plan,
+		&u.APIKey, &u.NotificationEmail, &u.NotificationSlack, &u.NotificationWeeklyDigest,
+		&u.PasswordHash, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
 func (d *DB) UpdateUserProfile(id int, name, email, githubUsername, avatarURL string) (*User, error) {
 	row := d.QueryRow(`
 		UPDATE users
