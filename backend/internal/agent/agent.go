@@ -14,6 +14,7 @@ import (
 
 	"github.com/codepilot/backend/internal/db"
 	gh "github.com/codepilot/backend/internal/github"
+	"google.golang.org/genai"
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -23,6 +24,8 @@ type Agent struct {
 	ghClient   *gh.Client
 	httpClient *http.Client
 	apiKey     string
+	gemini     *genai.Client
+	model      string
 }
 
 type ReviewRequest struct {
@@ -40,7 +43,7 @@ type ReviewResult struct {
 	AgentLog []db.AgentLogEntry
 }
 
-// ─── Claude API types ─────────────────────────────────────────────────────────
+// ─── Legacy Claude API types ─────────────────────────────────────────────────
 
 type claudeMessage struct {
 	Role    string        `json:"role"`
@@ -48,13 +51,13 @@ type claudeMessage struct {
 }
 
 type contentPart struct {
-	Type       string      `json:"type"`
-	Text       string      `json:"text,omitempty"`
-	ID         string      `json:"id,omitempty"`
-	Name       string      `json:"name,omitempty"`
-	Input      interface{} `json:"input,omitempty"`
-	ToolUseID  string      `json:"tool_use_id,omitempty"`
-	Content    string      `json:"content,omitempty"`
+	Type      string      `json:"type"`
+	Text      string      `json:"text,omitempty"`
+	ID        string      `json:"id,omitempty"`
+	Name      string      `json:"name,omitempty"`
+	Input     interface{} `json:"input,omitempty"`
+	ToolUseID string      `json:"tool_use_id,omitempty"`
+	Content   string      `json:"content,omitempty"`
 }
 
 type claudeRequest struct {
@@ -82,11 +85,25 @@ type claudeResponse struct {
 
 func New(database *db.DB) *Agent {
 	ghToken := os.Getenv("GITHUB_TOKEN")
+	model := os.Getenv("GEMINI_MODEL")
+	if model == "" {
+		model = "gemini-3-flash-preview"
+	}
+
+	geminiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
+		APIKey:  os.Getenv("GEMINI_API_KEY"),
+		Backend: genai.BackendGeminiAPI,
+	})
+	if err != nil {
+		log.Printf("failed to initialize Gemini client: %v", err)
+	}
 	return &Agent{
 		db:         database,
 		ghClient:   gh.NewClient(ghToken),
 		httpClient: &http.Client{Timeout: 120 * time.Second},
 		apiKey:     os.Getenv("ANTHROPIC_API_KEY"),
+		gemini:     geminiClient,
+		model:      model,
 	}
 }
 
@@ -159,6 +176,77 @@ var tools = []claudeTool{
 	},
 }
 
+var geminiTools = []*genai.Tool{
+	{
+		FunctionDeclarations: []*genai.FunctionDeclaration{
+			{
+				Name:        "read_pr_diff",
+				Description: "Fetches the raw unified diff for the PR. Returns the full git diff showing all added/removed lines across all changed files.",
+				ParametersJsonSchema: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+					"required":   []string{},
+				},
+			},
+			{
+				Name:        "post_github_comment",
+				Description: "Posts a formatted review comment on the GitHub PR. Use this after completing your analysis to share findings with the team.",
+				ParametersJsonSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"comment": map[string]any{
+							"type":        "string",
+							"description": "The markdown-formatted review comment to post",
+						},
+						"event": map[string]any{
+							"type":        "string",
+							"description": "Review event type based on severity of findings",
+							"enum":        []string{"COMMENT", "REQUEST_CHANGES", "APPROVE"},
+						},
+					},
+					"required": []string{"comment", "event"},
+				},
+			},
+			{
+				Name:        "report_issues",
+				Description: "Stores the structured list of issues found in this PR. Call this with all identified bugs, security issues, and code quality problems.",
+				ParametersJsonSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"summary": map[string]any{
+							"type":        "string",
+							"description": "A 2-3 sentence executive summary of the PR quality",
+						},
+						"severity": map[string]any{
+							"type":        "string",
+							"description": "Overall PR severity based on worst issue found",
+							"enum":        []string{"none", "info", "warning", "critical"},
+						},
+						"issues": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"file_path":   map[string]any{"type": "string"},
+									"line_start":  map[string]any{"type": "integer"},
+									"line_end":    map[string]any{"type": "integer"},
+									"severity":    map[string]any{"type": "string", "enum": []string{"info", "warning", "critical"}},
+									"category":    map[string]any{"type": "string", "enum": []string{"bug", "security", "performance", "style", "logic"}},
+									"title":       map[string]any{"type": "string"},
+									"description": map[string]any{"type": "string"},
+									"suggestion":  map[string]any{"type": "string"},
+								},
+								"required": []string{"file_path", "severity", "category", "title", "description"},
+							},
+						},
+					},
+					"required": []string{"summary", "severity", "issues"},
+				},
+			},
+		},
+	},
+}
+
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
 // ReviewPR runs the agentic tool-use loop for a single PR.
@@ -173,24 +261,21 @@ func (a *Agent) ReviewPR(ctx context.Context, req ReviewRequest) (*ReviewResult,
 		return nil, err
 	}
 
-	messages := []claudeMessage{
-		{
-			Role: "user",
-			Content: []contentPart{{
-				Type: "text",
-				Text: fmt.Sprintf(
-					"You are CodePilot, an expert AI code reviewer. Your job is to thoroughly review PR #%d in the repository %s.\n\n"+
-						"Follow this process:\n"+
-						"1. Call `read_pr_diff` to fetch the code changes\n"+
-						"2. Analyze the diff carefully for: bugs, security vulnerabilities, performance issues, logic errors, and code quality problems\n"+
-						"3. Call `report_issues` with your structured findings (even if there are no issues — report an empty array with a summary)\n"+
-						"4. Call `post_github_comment` with a well-formatted markdown summary for the PR author\n\n"+
-						"Be thorough but pragmatic. Flag real issues, not style nitpicks.",
-					req.PRNumber, req.RepoFullName,
-				),
-			}},
-		},
-	}
+	messages := []*genai.Content{{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{{
+			Text: fmt.Sprintf(
+				"You are CodePilot, an expert AI code reviewer. Your job is to thoroughly review PR #%d in the repository %s.\n\n"+
+					"Follow this process:\n"+
+					"1. Call `read_pr_diff` to fetch the code changes\n"+
+					"2. Analyze the diff carefully for: bugs, security vulnerabilities, performance issues, logic errors, and code quality problems\n"+
+					"3. Call `report_issues` with your structured findings (even if there are no issues — report an empty array with a summary)\n"+
+					"4. Call `post_github_comment` with a well-formatted markdown summary for the PR author\n\n"+
+					"Be thorough but pragmatic. Flag real issues, not style nitpicks.",
+				req.PRNumber, req.RepoFullName,
+			),
+		}},
+	}}
 
 	systemPrompt := "You are CodePilot, an autonomous AI code reviewer integrated with GitHub. " +
 		"You have access to tools to read PR diffs, analyze code, and post structured review comments. " +
@@ -201,53 +286,45 @@ func (a *Agent) ReviewPR(ctx context.Context, req ReviewRequest) (*ReviewResult,
 
 	// Agentic loop — max 10 turns to prevent runaway
 	for turn := 0; turn < 10; turn++ {
-		resp, err := a.callClaude(ctx, systemPrompt, messages)
+		resp, err := a.callGemini(ctx, systemPrompt, messages)
 		if err != nil {
-			return nil, fmt.Errorf("claude API error on turn %d: %w", turn, err)
+			return nil, fmt.Errorf("gemini API error on turn %d: %w", turn, err)
 		}
 
-		// Build assistant message from response content
-		assistantContent := resp.Content
-		messages = append(messages, claudeMessage{
-			Role:    "assistant",
-			Content: assistantContent,
-		})
-
-		// Process tool calls
-		toolResults := []contentPart{}
-		hasToolUse := false
-
-		for _, part := range resp.Content {
-			if part.Type != "tool_use" {
-				continue
-			}
-			hasToolUse = true
-
-			a.logAction(result, "tool_call", fmt.Sprintf("→ %s", part.Name))
-
-			toolResult, err := a.executeTool(ctx, part.Name, part.Input, part.ID,
-				owner, repo, req, result)
-			if err != nil {
-				log.Printf("Tool %s error: %v", part.Name, err)
-				toolResult = contentPart{
-					Type:      "tool_result",
-					ToolUseID: part.ID,
-					Content:   fmt.Sprintf("Error: %v", err),
-				}
-			}
-			toolResults = append(toolResults, toolResult)
+		if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+			return nil, fmt.Errorf("gemini returned no candidate content on turn %d", turn)
 		}
 
-		if !hasToolUse || resp.StopReason == "end_turn" {
+		messages = append(messages, resp.Candidates[0].Content)
+
+		functionCalls := resp.FunctionCalls()
+		if len(functionCalls) == 0 {
 			a.logAction(result, "agent_done", fmt.Sprintf("Completed with severity=%s", result.Severity))
 			break
 		}
 
-		// Return tool results to Claude
-		messages = append(messages, claudeMessage{
-			Role:    "user",
-			Content: toolResults,
-		})
+		toolResponses := []*genai.Content{}
+		for _, call := range functionCalls {
+			a.logAction(result, "tool_call", fmt.Sprintf("→ %s", call.Name))
+
+			toolResult, err := a.executeTool(ctx, call.Name, call.Args, "", owner, repo, req, result)
+			if err != nil {
+				log.Printf("Tool %s error: %v", call.Name, err)
+				toolResult = contentPart{Content: fmt.Sprintf("Error: %v", err)}
+			}
+
+			toolResponses = append(toolResponses, &genai.Content{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     call.Name,
+						Response: map[string]any{"content": toolResult.Content},
+					},
+				}},
+			})
+		}
+
+		messages = append(messages, toolResponses...)
 	}
 
 	// Persist agent log and final status
@@ -353,7 +430,7 @@ func (a *Agent) executeTool(ctx context.Context, toolName string, input interfac
 	return contentPart{}, fmt.Errorf("unknown tool: %s", toolName)
 }
 
-// ─── Claude API call ──────────────────────────────────────────────────────────
+// ─── Legacy Claude API call ───────────────────────────────────────────────────
 
 func (a *Agent) callClaude(ctx context.Context, system string, messages []claudeMessage) (*claudeResponse, error) {
 	reqBody := claudeRequest{
@@ -396,6 +473,23 @@ func (a *Agent) callClaude(ctx context.Context, system string, messages []claude
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &claudeResp, nil
+}
+
+func (a *Agent) callGemini(ctx context.Context, system string, messages []*genai.Content) (*genai.GenerateContentResponse, error) {
+	if a.gemini == nil {
+		return nil, fmt.Errorf("gemini client is not configured")
+	}
+
+	config := &genai.GenerateContentConfig{
+		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
+		Tools:             geminiTools,
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeAny},
+		},
+		Temperature: genai.Ptr[float32](0),
+	}
+
+	return a.gemini.Models.GenerateContent(ctx, a.model, messages, config)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

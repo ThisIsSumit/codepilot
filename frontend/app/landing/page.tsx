@@ -52,7 +52,7 @@ export default function LandingPage() {
 
         {/* Nav links */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '32px' }}>
-          {['Features', 'How it works', 'Pricing'].map((label) => (
+          {['Features', 'How it works'].map((label) => (
             <a
               key={label}
               href={`#${label.toLowerCase().replace(/ /g, '-')}`}
@@ -555,7 +555,7 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* ── Pricing ──────────────────────────────────────────────────────── */}
+      {/* ── Pricing ────────────────────────────────────────────────────────
       <section
         id="pricing"
         style={{
@@ -751,7 +751,7 @@ export default function LandingPage() {
             )})}
           </div>
         </div>
-      </section>
+      </section> */}
 
       {/* ── Footer ───────────────────────────────────────────────────────── */}
       <footer
@@ -774,7 +774,7 @@ export default function LandingPage() {
               color: 'var(--text-muted)',
             }}
           >
-            CodePilot © 2025
+            CodePilot © 2026
           </span>
         </div>
         <div style={{ display: 'flex', gap: '24px' }}>
