@@ -149,6 +149,8 @@ railway up --service backend
 
 Set env vars in Railway dashboard: `DATABASE_URL`, `REDIS_URL`, `GEMINI_API_KEY`, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`
 
+If you want email or Slack notifications to actually send, also set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, and `SLACK_WEBHOOK_URL`.
+
 ### Frontend → Vercel
 
 ```bash

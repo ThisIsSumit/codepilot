@@ -11,6 +11,7 @@ import (
 
 	"github.com/codepilot/backend/internal/api"
 	"github.com/codepilot/backend/internal/db"
+	"github.com/codepilot/backend/internal/notifications"
 	"github.com/codepilot/backend/internal/queue"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -38,10 +39,13 @@ func main() {
 	}
 	defer q.Close()
 
+	notifier := notifications.New(database)
+
 	// Start background worker (consumes PR review jobs)
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
-	go q.StartWorker(workerCtx, database)
+	go q.StartWorker(workerCtx, database, notifier)
+	go notifier.StartWeeklyDigestScheduler(workerCtx)
 
 	// Setup router
 	if os.Getenv("ENV") == "production" {

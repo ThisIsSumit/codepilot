@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/codepilot/backend/internal/db"
+	"github.com/codepilot/backend/internal/notifications"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -79,7 +80,7 @@ func (q *Queue) QueueDepth(ctx context.Context) (int64, error) {
 // StartWorker runs a blocking loop that processes jobs one at a time.
 // It uses a reliable queue pattern: BRPOPLPUSH moves the job to a
 // "processing" list before handling, so a crash can be recovered.
-func (q *Queue) StartWorker(ctx context.Context, database *db.DB) {
+func (q *Queue) StartWorker(ctx context.Context, database *db.DB, notifier *notifications.Service) {
 	log.Println("Worker started — polling for jobs...")
 
 	for {
@@ -117,7 +118,7 @@ func (q *Queue) StartWorker(ctx context.Context, database *db.DB) {
 		log.Printf("Worker: processing review_id=%d repo=%s PR#%d",
 			job.ReviewID, job.RepoFullName, job.PRNumber)
 
-		processJob(ctx, database, job)
+		processJob(ctx, database, notifier, job)
 
 		// Remove from processing queue after successful handling
 		q.removeFromProcessing(ctx, result)

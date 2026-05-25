@@ -6,11 +6,12 @@ import (
 
 	"github.com/codepilot/backend/internal/agent"
 	"github.com/codepilot/backend/internal/db"
+	"github.com/codepilot/backend/internal/notifications"
 )
 
 // processJob is called by the worker for each dequeued job.
 // It runs the Gemini agent and persists the results.
-func processJob(ctx context.Context, database *db.DB, job PRJob) {
+func processJob(ctx context.Context, database *db.DB, notifier *notifications.Service, job PRJob) {
 	// Mark as processing
 	if err := database.UpdateReviewStatus(job.ReviewID, "processing", "none", "", 0, "[]"); err != nil {
 		log.Printf("processJob: failed to mark processing: %v", err)
@@ -28,9 +29,15 @@ func processJob(ctx context.Context, database *db.DB, job PRJob) {
 	if err != nil {
 		log.Printf("processJob: agent error for review %d: %v", job.ReviewID, err)
 		database.UpdateReviewStatus(job.ReviewID, "failed", "none", err.Error(), 0, "[]")
+		if notifier != nil {
+			notifier.NotifyReviewCompleted(ctx, job.ReviewID)
+		}
 		return
 	}
 
 	log.Printf("processJob: review %d done — severity=%s issues=%d",
 		job.ReviewID, result.Severity, len(result.Issues))
+	if notifier != nil {
+		notifier.NotifyReviewCompleted(ctx, job.ReviewID)
+	}
 }

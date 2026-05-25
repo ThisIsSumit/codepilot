@@ -187,6 +187,31 @@ func (d *DB) GetUserByID(id int) (*User, error) {
 	return &u, nil
 }
 
+func (d *DB) ListUsers() ([]User, error) {
+	rows, err := d.Query(`
+		SELECT id, name, email, github_username, avatar_url, plan, api_key,
+		       notification_email, notification_slack, notification_weekly_digest,
+		       password_hash, created_at
+		FROM users ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := make([]User, 0)
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.GitHubUsername, &u.AvatarURL, &u.Plan,
+			&u.APIKey, &u.NotificationEmail, &u.NotificationSlack, &u.NotificationWeeklyDigest,
+			&u.PasswordHash, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
 // UpsertUserFromGitHub inserts or updates a user based on their email from GitHub OAuth.
 func (d *DB) UpsertUserFromGitHub(name, email, githubUsername, avatarURL string) (*User, error) {
 	row := d.QueryRow(`
