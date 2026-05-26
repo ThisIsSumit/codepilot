@@ -10,7 +10,7 @@ import (
 )
 
 // processJob is called by the worker for each dequeued job.
-// It runs the Gemini agent and persists the results.
+// It runs the OpenRouter-backed agent and persists the results.
 func processJob(ctx context.Context, database *db.DB, notifier *notifications.Service, job PRJob) {
 	// Mark as processing
 	if err := database.UpdateReviewStatus(job.ReviewID, "processing", "none", "", 0, "[]"); err != nil {

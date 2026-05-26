@@ -45,6 +45,7 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	go q.StartWorker(workerCtx, database, notifier)
+	go q.StartFailedReviewRetryScheduler(workerCtx, database)
 	go notifier.StartWeeklyDigestScheduler(workerCtx)
 
 	// Setup router

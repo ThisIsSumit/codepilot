@@ -2,7 +2,9 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -444,6 +446,36 @@ func (d *DB) ListReviews(limit int) ([]Review, error) {
 	return reviews, rows.Err()
 }
 
+func (d *DB) ListFailedReviews(limit int) ([]Review, error) {
+	rows, err := d.Query(`
+		SELECT id, repo_full_name, pr_number, pr_title, pr_author, pr_url,
+		       status, severity, COALESCE(summary,''), issues_count, agent_log::text, created_at, updated_at
+		FROM reviews
+		WHERE status = 'failed'
+		ORDER BY updated_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reviews []Review
+	for rows.Next() {
+		var r Review
+		var logStr string
+		err := rows.Scan(&r.ID, &r.RepoFullName, &r.PRNumber, &r.PRTitle, &r.PRAuthor,
+			&r.PRUrl, &r.Status, &r.Severity, &r.Summary, &r.IssuesCount, &logStr,
+			&r.CreatedAt, &r.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		r.AgentLog = parseAgentLog(logStr)
+		reviews = append(reviews, r)
+	}
+	return reviews, rows.Err()
+}
+
 func (d *DB) GetReview(id int) (*Review, error) {
 	row := d.QueryRow(`
 		SELECT id, repo_full_name, pr_number, pr_title, pr_author, pr_url,
@@ -585,5 +617,17 @@ func scanReview(row *sql.Row, _ string) (*Review, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.AgentLog = parseAgentLog(logStr)
 	return &r, nil
+}
+
+func parseAgentLog(logStr string) []AgentLogEntry {
+	if strings.TrimSpace(logStr) == "" {
+		return []AgentLogEntry{}
+	}
+	var entries []AgentLogEntry
+	if err := json.Unmarshal([]byte(logStr), &entries); err != nil {
+		return []AgentLogEntry{}
+	}
+	return entries
 }

@@ -1,33 +1,33 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	openrouter "github.com/OpenRouterTeam/go-sdk"
+	"github.com/OpenRouterTeam/go-sdk/models/components"
+	"github.com/OpenRouterTeam/go-sdk/models/operations"
+	"github.com/OpenRouterTeam/go-sdk/optionalnullable"
 	"github.com/codepilot/backend/internal/db"
 	gh "github.com/codepilot/backend/internal/github"
-	"google.golang.org/genai"
 )
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
+// Agent coordinates the PR review workflow.
 type Agent struct {
 	db         *db.DB
 	ghClient   *gh.Client
 	httpClient *http.Client
-	apiKey     string
-	gemini     *genai.Client
+	orClient   *openrouter.OpenRouter
 	model      string
 }
 
+// ReviewRequest identifies a review job.
 type ReviewRequest struct {
 	ReviewID     int
 	RepoFullName string
@@ -36,6 +36,7 @@ type ReviewRequest struct {
 	InstallID    int64
 }
 
+// ReviewResult captures the review output.
 type ReviewResult struct {
 	Severity string
 	Summary  string
@@ -43,211 +44,41 @@ type ReviewResult struct {
 	AgentLog []db.AgentLogEntry
 }
 
-// ─── Legacy Claude API types ─────────────────────────────────────────────────
-
-type claudeMessage struct {
-	Role    string        `json:"role"`
-	Content []contentPart `json:"content"`
+type reportIssuesPayload struct {
+	Summary  string `json:"summary"`
+	Severity string `json:"severity"`
+	Issues   []struct {
+		FilePath    string `json:"file_path"`
+		LineStart   int    `json:"line_start"`
+		LineEnd     int    `json:"line_end"`
+		Severity    string `json:"severity"`
+		Category    string `json:"category"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Suggestion  string `json:"suggestion"`
+	} `json:"issues"`
 }
 
-type contentPart struct {
-	Type      string      `json:"type"`
-	Text      string      `json:"text,omitempty"`
-	ID        string      `json:"id,omitempty"`
-	Name      string      `json:"name,omitempty"`
-	Input     interface{} `json:"input,omitempty"`
-	ToolUseID string      `json:"tool_use_id,omitempty"`
-	Content   string      `json:"content,omitempty"`
-}
-
-type claudeRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	System    string          `json:"system"`
-	Tools     []claudeTool    `json:"tools"`
-	Messages  []claudeMessage `json:"messages"`
-}
-
-type claudeTool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
-}
-
-type claudeResponse struct {
-	ID         string        `json:"id"`
-	Type       string        `json:"type"`
-	StopReason string        `json:"stop_reason"`
-	Content    []contentPart `json:"content"`
-}
-
-// ─── Constructor ─────────────────────────────────────────────────────────────
-
+// New wires the agent dependencies.
 func New(database *db.DB) *Agent {
-	ghToken := os.Getenv("GITHUB_TOKEN")
-	model := os.Getenv("GEMINI_MODEL")
+	ghToken := strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	model := strings.TrimSpace(os.Getenv("OPENROUTER_MODEL"))
 	if model == "" {
-		model = "gemini-3-flash-preview"
+		model = "openai/gpt-4o-mini"
 	}
 
-	geminiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
-		APIKey:  os.Getenv("GEMINI_API_KEY"),
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		log.Printf("failed to initialize Gemini client: %v", err)
-	}
 	return &Agent{
 		db:         database,
 		ghClient:   gh.NewClient(ghToken),
 		httpClient: &http.Client{Timeout: 120 * time.Second},
-		apiKey:     os.Getenv("ANTHROPIC_API_KEY"),
-		gemini:     geminiClient,
-		model:      model,
+		orClient: openrouter.New(
+			openrouter.WithServerURL("https://openrouter.ai/api/v1"),
+			openrouter.WithSecurity(strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))),
+			openrouter.WithClient(&http.Client{Timeout: 120 * time.Second}),
+		),
+		model: model,
 	}
 }
-
-// ─── Tool definitions ─────────────────────────────────────────────────────────
-
-var tools = []claudeTool{
-	{
-		Name:        "read_pr_diff",
-		Description: "Fetches the raw unified diff for the PR. Returns the full git diff showing all added/removed lines across all changed files.",
-		InputSchema: map[string]interface{}{
-			"type":       "object",
-			"properties": map[string]interface{}{},
-			"required":   []string{},
-		},
-	},
-	{
-		Name:        "post_github_comment",
-		Description: "Posts a formatted review comment on the GitHub PR. Use this after completing your analysis to share findings with the team.",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"comment": map[string]interface{}{
-					"type":        "string",
-					"description": "The markdown-formatted review comment to post",
-				},
-				"event": map[string]interface{}{
-					"type":        "string",
-					"enum":        []string{"COMMENT", "REQUEST_CHANGES", "APPROVE"},
-					"description": "Review event type based on severity of findings",
-				},
-			},
-			"required": []string{"comment", "event"},
-		},
-	},
-	{
-		Name:        "report_issues",
-		Description: "Stores the structured list of issues found in this PR. Call this with all identified bugs, security issues, and code quality problems.",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"summary": map[string]interface{}{
-					"type":        "string",
-					"description": "A 2-3 sentence executive summary of the PR quality",
-				},
-				"severity": map[string]interface{}{
-					"type":        "string",
-					"enum":        []string{"none", "info", "warning", "critical"},
-					"description": "Overall PR severity based on worst issue found",
-				},
-				"issues": map[string]interface{}{
-					"type": "array",
-					"items": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path":   map[string]interface{}{"type": "string"},
-							"line_start":  map[string]interface{}{"type": "integer"},
-							"line_end":    map[string]interface{}{"type": "integer"},
-							"severity":    map[string]interface{}{"type": "string", "enum": []string{"info", "warning", "critical"}},
-							"category":    map[string]interface{}{"type": "string", "enum": []string{"bug", "security", "performance", "style", "logic"}},
-							"title":       map[string]interface{}{"type": "string"},
-							"description": map[string]interface{}{"type": "string"},
-							"suggestion":  map[string]interface{}{"type": "string"},
-						},
-						"required": []string{"file_path", "severity", "category", "title", "description"},
-					},
-				},
-			},
-			"required": []string{"summary", "severity", "issues"},
-		},
-	},
-}
-
-var geminiTools = []*genai.Tool{
-	{
-		FunctionDeclarations: []*genai.FunctionDeclaration{
-			{
-				Name:        "read_pr_diff",
-				Description: "Fetches the raw unified diff for the PR. Returns the full git diff showing all added/removed lines across all changed files.",
-				ParametersJsonSchema: map[string]any{
-					"type":       "object",
-					"properties": map[string]any{},
-					"required":   []string{},
-				},
-			},
-			{
-				Name:        "post_github_comment",
-				Description: "Posts a formatted review comment on the GitHub PR. Use this after completing your analysis to share findings with the team.",
-				ParametersJsonSchema: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"comment": map[string]any{
-							"type":        "string",
-							"description": "The markdown-formatted review comment to post",
-						},
-						"event": map[string]any{
-							"type":        "string",
-							"description": "Review event type based on severity of findings",
-							"enum":        []string{"COMMENT", "REQUEST_CHANGES", "APPROVE"},
-						},
-					},
-					"required": []string{"comment", "event"},
-				},
-			},
-			{
-				Name:        "report_issues",
-				Description: "Stores the structured list of issues found in this PR. Call this with all identified bugs, security issues, and code quality problems.",
-				ParametersJsonSchema: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"summary": map[string]any{
-							"type":        "string",
-							"description": "A 2-3 sentence executive summary of the PR quality",
-						},
-						"severity": map[string]any{
-							"type":        "string",
-							"description": "Overall PR severity based on worst issue found",
-							"enum":        []string{"none", "info", "warning", "critical"},
-						},
-						"issues": map[string]any{
-							"type": "array",
-							"items": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"file_path":   map[string]any{"type": "string"},
-									"line_start":  map[string]any{"type": "integer"},
-									"line_end":    map[string]any{"type": "integer"},
-									"severity":    map[string]any{"type": "string", "enum": []string{"info", "warning", "critical"}},
-									"category":    map[string]any{"type": "string", "enum": []string{"bug", "security", "performance", "style", "logic"}},
-									"title":       map[string]any{"type": "string"},
-									"description": map[string]any{"type": "string"},
-									"suggestion":  map[string]any{"type": "string"},
-								},
-								"required": []string{"file_path", "severity", "category", "title", "description"},
-							},
-						},
-					},
-					"required": []string{"summary", "severity", "issues"},
-				},
-			},
-		},
-	},
-}
-
-// ─── Agent loop ───────────────────────────────────────────────────────────────
 
 // ReviewPR runs the agentic tool-use loop for a single PR.
 func (a *Agent) ReviewPR(ctx context.Context, req ReviewRequest) (*ReviewResult, error) {
@@ -261,83 +92,97 @@ func (a *Agent) ReviewPR(ctx context.Context, req ReviewRequest) (*ReviewResult,
 		return nil, err
 	}
 
-	messages := []*genai.Content{{
-		Role: genai.RoleUser,
-		Parts: []*genai.Part{{
-			Text: fmt.Sprintf(
-				"You are CodePilot, an expert AI code reviewer. Your job is to thoroughly review PR #%d in the repository %s.\n\n"+
-					"Follow this process:\n"+
-					"1. Call `read_pr_diff` to fetch the code changes\n"+
-					"2. Analyze the diff carefully for: bugs, security vulnerabilities, performance issues, logic errors, and code quality problems\n"+
-					"3. Call `report_issues` with your structured findings (even if there are no issues — report an empty array with a summary)\n"+
-					"4. Call `post_github_comment` with a well-formatted markdown summary for the PR author\n\n"+
-					"Be thorough but pragmatic. Flag real issues, not style nitpicks.",
-				req.PRNumber, req.RepoFullName,
-			),
-		}},
-	}}
+	userPrompt := fmt.Sprintf(
+		"You are CodePilot, an expert AI code reviewer. Your job is to thoroughly review PR #%d in the repository %s.\n\n"+
+			"Follow this process:\n"+
+			"1. Call read_pr_diff to fetch the code changes\n"+
+			"2. Analyze the diff carefully for bugs, security vulnerabilities, performance issues, logic errors, and code quality problems\n"+
+			"3. Call report_issues with structured findings, even if there are no issues\n"+
+			"4. Call post_github_comment with a well-formatted markdown summary for the PR author\n\n"+
+			"Be thorough but pragmatic. Flag real issues, not style nitpicks.",
+		req.PRNumber,
+		req.RepoFullName,
+	)
 
-	systemPrompt := "You are CodePilot, an autonomous AI code reviewer integrated with GitHub. " +
-		"You have access to tools to read PR diffs, analyze code, and post structured review comments. " +
-		"Always use all three tools: read_pr_diff → report_issues → post_github_comment. " +
-		"Be precise, technical, and actionable in your feedback."
+	messages := []components.ChatMessages{
+		components.CreateChatMessagesSystem(components.ChatSystemMessage{
+			Content: components.CreateChatSystemMessageContentStr(
+				"You are CodePilot, an autonomous AI code reviewer integrated with GitHub. You have access to tools to read PR diffs, analyze code, and post structured review comments. Always use all three tools: read_pr_diff -> report_issues -> post_github_comment. Be precise, technical, and actionable in your feedback.",
+			),
+			Role: components.ChatSystemMessageRoleSystem,
+		}),
+		components.CreateChatMessagesUser(components.ChatUserMessage{
+			Content: components.CreateChatUserMessageContentStr(userPrompt),
+			Role:    components.ChatUserMessageRoleUser,
+		}),
+	}
 
 	a.logAction(result, "agent_start", fmt.Sprintf("Starting review for %s PR#%d", req.RepoFullName, req.PRNumber))
+	needReport := true
+	needComment := true
 
-	// Agentic loop — max 10 turns to prevent runaway
 	for turn := 0; turn < 10; turn++ {
-		resp, err := a.callGemini(ctx, systemPrompt, messages)
+		resp, err := a.callOpenRouter(ctx, messages)
 		if err != nil {
-			return nil, fmt.Errorf("gemini API error on turn %d: %w", turn, err)
+			return nil, fmt.Errorf("openrouter API error on turn %d: %w", turn, err)
 		}
 
-		if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
-			return nil, fmt.Errorf("gemini returned no candidate content on turn %d", turn)
+		if len(resp.ChatResult.Choices) == 0 {
+			return nil, fmt.Errorf("openrouter returned no choices on turn %d", turn)
 		}
 
-		messages = append(messages, resp.Candidates[0].Content)
+		assistantMessage := resp.ChatResult.Choices[0].Message
+		messages = append(messages, components.CreateChatMessagesAssistant(assistantMessage))
 
-		functionCalls := resp.FunctionCalls()
-		if len(functionCalls) == 0 {
+		if len(assistantMessage.ToolCalls) == 0 {
+			if needReport || needComment {
+				messages = append(messages, components.CreateChatMessagesUser(components.ChatUserMessage{
+					Role: components.ChatUserMessageRoleUser,
+					Content: components.CreateChatUserMessageContentStr(
+						"You have not finished the review. You must always call report_issues with a structured summary, even when no issues are found. If report_issues is already done, call post_github_comment before finishing. Do not end the turn until both the structured report and the GitHub review comment have been produced.",
+					),
+				}))
+				continue
+			}
+
 			a.logAction(result, "agent_done", fmt.Sprintf("Completed with severity=%s", result.Severity))
 			break
 		}
 
-		toolResponses := []*genai.Content{}
-		for _, call := range functionCalls {
-			a.logAction(result, "tool_call", fmt.Sprintf("→ %s", call.Name))
+		for _, call := range assistantMessage.ToolCalls {
+			a.logAction(result, "tool_call", fmt.Sprintf("→ %s", call.Function.Name))
 
-			toolResult, err := a.executeTool(ctx, call.Name, call.Args, "", owner, repo, req, result)
+			toolResult, err := a.executeTool(ctx, call.Function.Name, call.Function.Arguments, owner, repo, req, result)
 			if err != nil {
-				log.Printf("Tool %s error: %v", call.Name, err)
-				toolResult = contentPart{Content: fmt.Sprintf("Error: %v", err)}
+				log.Printf("Tool %s error: %v", call.Function.Name, err)
+				toolResult = fmt.Sprintf("Error: %v", err)
 			}
 
-			toolResponses = append(toolResponses, &genai.Content{
-				Role: genai.RoleUser,
-				Parts: []*genai.Part{{
-					FunctionResponse: &genai.FunctionResponse{
-						Name:     call.Name,
-						Response: map[string]any{"content": toolResult.Content},
-					},
-				}},
-			})
-		}
+			switch call.Function.Name {
+			case "report_issues":
+				needReport = false
+			case "post_github_comment":
+				needComment = false
+			}
 
-		messages = append(messages, toolResponses...)
+			messages = append(messages, components.CreateChatMessagesTool(components.ChatToolMessage{
+				Role:       components.ChatToolMessageRoleTool,
+				ToolCallID: call.ID,
+				Content:    components.CreateChatToolMessageContentStr(toolResult),
+			}))
+		}
 	}
 
-	// Persist agent log and final status
+	if result.Summary == "" {
+		if len(result.Issues) == 0 {
+			result.Summary = "Automated review completed. No blocking issues were found, but the PR was still analyzed for bugs, security problems, logic errors, performance risks, and code quality concerns."
+		} else {
+			result.Summary = fmt.Sprintf("Automated review completed with %d issue(s) found.", len(result.Issues))
+		}
+	}
+
 	logJSON := marshalAgentLog(result.AgentLog)
-	err = a.db.UpdateReviewStatus(
-		req.ReviewID,
-		"done",
-		result.Severity,
-		result.Summary,
-		len(result.Issues),
-		logJSON,
-	)
-	if err != nil {
+	if err := a.db.UpdateReviewStatus(req.ReviewID, "done", result.Severity, result.Summary, len(result.Issues), logJSON); err != nil {
 		log.Printf("Failed to update review status: %v", err)
 	}
 
@@ -350,152 +195,167 @@ func (a *Agent) ReviewPR(ctx context.Context, req ReviewRequest) (*ReviewResult,
 	return result, nil
 }
 
-// ─── Tool executor ────────────────────────────────────────────────────────────
+func (a *Agent) callOpenRouter(ctx context.Context, messages []components.ChatMessages) (*operations.SendChatCompletionRequestResponse, error) {
+	if a.orClient == nil {
+		return nil, fmt.Errorf("openrouter client is not configured")
+	}
 
-func (a *Agent) executeTool(ctx context.Context, toolName string, input interface{},
-	toolUseID string, owner, repo string, req ReviewRequest, result *ReviewResult,
-) (contentPart, error) {
+	res, err := a.orClient.Chat.Send(ctx, components.ChatRequest{
+		Model:             openrouter.Pointer(a.model),
+		Messages:          messages,
+		MaxTokens:         optionalnullable.From(openrouter.Pointer[int64](4096)),
+		Temperature:       optionalnullable.From(openrouter.Pointer[float64](0)),
+		ParallelToolCalls: optionalnullable.From(openrouter.Pointer(false)),
+		Tools:             openRouterTools(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if res.Type != operations.SendChatCompletionRequestResponseTypeChatResult {
+		return nil, fmt.Errorf("unexpected openrouter response type: %s", res.Type)
+	}
+	return res, nil
+}
+
+func openRouterTools() []components.ChatFunctionTool {
+	return []components.ChatFunctionTool{
+		components.CreateChatFunctionToolChatFunctionToolFunction(components.ChatFunctionToolFunction{
+			Type: components.ChatFunctionToolTypeFunction,
+			Function: components.ChatFunctionToolFunctionFunction{
+				Name:        "read_pr_diff",
+				Description: openrouter.Pointer("Fetches the raw unified diff for the PR. Returns the full git diff showing all added/removed lines across all changed files."),
+				Parameters:  objectSchema(nil, nil),
+				Strict:      optionalnullable.From(openrouter.Pointer(true)),
+			},
+		}),
+		components.CreateChatFunctionToolChatFunctionToolFunction(components.ChatFunctionToolFunction{
+			Type: components.ChatFunctionToolTypeFunction,
+			Function: components.ChatFunctionToolFunctionFunction{
+				Name:        "post_github_comment",
+				Description: openrouter.Pointer("Posts a formatted review comment on the GitHub PR. Use this after completing your analysis to share findings with the team."),
+				Parameters: objectSchema(map[string]any{
+					"comment": map[string]any{
+						"type":        "string",
+						"description": "The markdown-formatted review comment to post",
+					},
+					"event": map[string]any{
+						"type":        "string",
+						"description": "Review event type based on severity of findings",
+						"enum":        []string{"COMMENT", "REQUEST_CHANGES", "APPROVE"},
+					},
+				}, []string{"comment", "event"}),
+				Strict: optionalnullable.From(openrouter.Pointer(true)),
+			},
+		}),
+		components.CreateChatFunctionToolChatFunctionToolFunction(components.ChatFunctionToolFunction{
+			Type: components.ChatFunctionToolTypeFunction,
+			Function: components.ChatFunctionToolFunctionFunction{
+				Name:        "report_issues",
+				Description: openrouter.Pointer("Stores the structured list of issues found in this PR. Call this with all identified bugs, security issues, and code quality problems."),
+				Parameters: objectSchema(map[string]any{
+					"summary": map[string]any{
+						"type":        "string",
+						"description": "A 2-3 sentence executive summary of the PR quality",
+					},
+					"severity": map[string]any{
+						"type":        "string",
+						"description": "Overall PR severity based on worst issue found",
+						"enum":        []string{"none", "info", "warning", "critical"},
+					},
+					"issues": map[string]any{
+						"type": "array",
+						"items": objectSchema(map[string]any{
+							"file_path":   map[string]any{"type": "string"},
+							"line_start":  map[string]any{"type": "integer"},
+							"line_end":    map[string]any{"type": "integer"},
+							"severity":    map[string]any{"type": "string", "enum": []string{"info", "warning", "critical"}},
+							"category":    map[string]any{"type": "string", "enum": []string{"bug", "security", "performance", "style", "logic"}},
+							"title":       map[string]any{"type": "string"},
+							"description": map[string]any{"type": "string"},
+							"suggestion":  map[string]any{"type": "string"},
+						}, []string{"file_path", "severity", "category", "title", "description"}),
+					},
+				}, []string{"summary", "severity", "issues"}),
+				Strict: optionalnullable.From(openrouter.Pointer(true)),
+			},
+		}),
+	}
+}
+
+func objectSchema(properties map[string]any, required []string) map[string]any {
+	if properties == nil {
+		properties = map[string]any{}
+	}
+	if required == nil {
+		required = []string{}
+	}
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           properties,
+		"required":             required,
+	}
+}
+
+func (a *Agent) executeTool(ctx context.Context, toolName string, input string, owner, repo string, req ReviewRequest, result *ReviewResult) (string, error) {
+	_ = ctx
+
 	switch toolName {
-
 	case "read_pr_diff":
 		diff, err := a.ghClient.FetchDiff(req.DiffURL)
 		if err != nil {
-			return contentPart{}, err
+			return "", err
 		}
-		// Truncate very large diffs
-		if len(diff) > 100_000 {
-			diff = diff[:100_000] + "\n\n[Diff truncated — too large]"
-		}
-		a.logAction(result, "diff_fetched", fmt.Sprintf("Fetched %d bytes of diff", len(diff)))
-		return contentPart{
-			Type:      "tool_result",
-			ToolUseID: toolUseID,
-			Content:   diff,
-		}, nil
+		return diff, nil
 
 	case "report_issues":
-		data := toMap(input)
-		result.Summary = getString(data, "summary")
-		result.Severity = getString(data, "severity")
-
-		if issuesRaw, ok := data["issues"].([]interface{}); ok {
-			for _, raw := range issuesRaw {
-				issMap := toMap(raw)
-				iss := db.ReviewIssue{
-					ReviewID:    req.ReviewID,
-					FilePath:    getString(issMap, "file_path"),
-					Severity:    getString(issMap, "severity"),
-					Category:    getString(issMap, "category"),
-					Title:       getString(issMap, "title"),
-					Description: getString(issMap, "description"),
-					Suggestion:  getString(issMap, "suggestion"),
-					LineStart:   getInt(issMap, "line_start"),
-					LineEnd:     getInt(issMap, "line_end"),
-				}
-				result.Issues = append(result.Issues, iss)
-			}
+		var payload reportIssuesPayload
+		if err := json.Unmarshal([]byte(input), &payload); err != nil {
+			return "", fmt.Errorf("parse report_issues payload: %w", err)
 		}
-		a.logAction(result, "issues_reported",
-			fmt.Sprintf("Severity=%s, %d issues found", result.Severity, len(result.Issues)))
-		return contentPart{
-			Type:      "tool_result",
-			ToolUseID: toolUseID,
-			Content:   fmt.Sprintf("Issues recorded: %d", len(result.Issues)),
-		}, nil
+
+		result.Severity = payload.Severity
+		result.Summary = payload.Summary
+		result.Issues = make([]db.ReviewIssue, 0, len(payload.Issues))
+		for _, issue := range payload.Issues {
+			result.Issues = append(result.Issues, db.ReviewIssue{
+				FilePath:    issue.FilePath,
+				LineStart:   issue.LineStart,
+				LineEnd:     issue.LineEnd,
+				Severity:    issue.Severity,
+				Category:    issue.Category,
+				Title:       issue.Title,
+				Description: issue.Description,
+				Suggestion:  issue.Suggestion,
+			})
+		}
+
+		return fmt.Sprintf("Severity=%s, %d issues found", result.Severity, len(result.Issues)), nil
 
 	case "post_github_comment":
-		data := toMap(input)
-		comment := getString(data, "comment")
-		event := getString(data, "event")
-
-		if a.ghClient != nil && os.Getenv("GITHUB_TOKEN") != "" {
-			if err := a.ghClient.PostReviewRequest(owner, repo, req.PRNumber, event, comment); err != nil {
-				a.logAction(result, "comment_failed", err.Error())
-				return contentPart{
-					Type:      "tool_result",
-					ToolUseID: toolUseID,
-					Content:   "Failed to post comment: " + err.Error(),
-				}, nil
-			}
+		var payload struct {
+			Comment string `json:"comment"`
+			Event   string `json:"event"`
 		}
-		a.logAction(result, "comment_posted",
-			fmt.Sprintf("Posted %s review to GitHub", event))
-		return contentPart{
-			Type:      "tool_result",
-			ToolUseID: toolUseID,
-			Content:   "Comment posted successfully",
-		}, nil
-	}
+		if err := json.Unmarshal([]byte(input), &payload); err != nil {
+			return "", fmt.Errorf("parse post_github_comment payload: %w", err)
+		}
 
-	return contentPart{}, fmt.Errorf("unknown tool: %s", toolName)
+		event := strings.ToUpper(strings.TrimSpace(payload.Event))
+		if event == "" {
+			event = "COMMENT"
+		}
+		if err := a.ghClient.PostReviewRequest(owner, repo, req.PRNumber, event, payload.Comment); err != nil {
+			return "", err
+		}
+		return "Comment posted", nil
+
+	default:
+		return "", fmt.Errorf("unknown tool: %s", toolName)
+	}
 }
-
-// ─── Legacy Claude API call ───────────────────────────────────────────────────
-
-func (a *Agent) callClaude(ctx context.Context, system string, messages []claudeMessage) (*claudeResponse, error) {
-	reqBody := claudeRequest{
-		Model:     "claude-opus-4-6",
-		MaxTokens: 4096,
-		System:    system,
-		Tools:     tools,
-		Messages:  messages,
-	}
-
-	payload, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		"https://api.anthropic.com/v1/messages",
-		bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", a.apiKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := a.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("anthropic API %d: %s", resp.StatusCode, string(body))
-	}
-
-	var claudeResp claudeResponse
-	if err := json.Unmarshal(body, &claudeResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	return &claudeResp, nil
-}
-
-func (a *Agent) callGemini(ctx context.Context, system string, messages []*genai.Content) (*genai.GenerateContentResponse, error) {
-	if a.gemini == nil {
-		return nil, fmt.Errorf("gemini client is not configured")
-	}
-
-	config := &genai.GenerateContentConfig{
-		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
-		Tools:             geminiTools,
-		ToolConfig: &genai.ToolConfig{
-			FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeAny},
-		},
-		Temperature: genai.Ptr[float32](0),
-	}
-
-	return a.gemini.Models.GenerateContent(ctx, a.model, messages, config)
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func (a *Agent) logAction(result *ReviewResult, action, detail string) {
-	log.Printf("[agent] %s: %s", action, detail)
 	result.AgentLog = append(result.AgentLog, db.AgentLogEntry{
 		Timestamp: time.Now().UTC(),
 		Action:    action,
@@ -503,42 +363,13 @@ func (a *Agent) logAction(result *ReviewResult, action, detail string) {
 	})
 }
 
-func marshalAgentLog(log []db.AgentLogEntry) string {
-	b, err := json.Marshal(log)
+func marshalAgentLog(logEntries []db.AgentLogEntry) string {
+	if len(logEntries) == 0 {
+		return "[]"
+	}
+	buf, err := json.Marshal(logEntries)
 	if err != nil {
 		return "[]"
 	}
-	return string(b)
-}
-
-func toMap(v interface{}) map[string]interface{} {
-	if m, ok := v.(map[string]interface{}); ok {
-		return m
-	}
-	// Try re-marshaling
-	b, _ := json.Marshal(v)
-	var m map[string]interface{}
-	json.Unmarshal(b, &m)
-	return m
-}
-
-func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return strings.TrimSpace(s)
-		}
-	}
-	return ""
-}
-
-func getInt(m map[string]interface{}, key string) int {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case float64:
-			return int(n)
-		case int:
-			return n
-		}
-	}
-	return 0
+	return string(buf)
 }

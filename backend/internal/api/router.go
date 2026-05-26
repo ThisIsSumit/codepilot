@@ -43,6 +43,7 @@ func NewRouter(database *db.DB, q *queue.Queue) *gin.Engine {
 
 		// Webhooks
 		v1.POST("/webhooks/github", h.handleGitHubWebhook)
+		v1.POST("/reviews/dev/seed-critical", h.seedCriticalReview)
 
 		protected := v1.Group("/")
 		protected.Use(h.requireAuth())
@@ -283,6 +284,65 @@ func (h *Handler) triggerReview(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"review_id": review.ID, "status": "enqueued"})
+}
+
+// seedCriticalReview creates a synthetic critical review for local testing.
+func (h *Handler) seedCriticalReview(c *gin.Context) {
+	if os.Getenv("ENV") == "production" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "disabled in production"})
+		return
+	}
+
+	review, err := h.db.UpsertReview(&db.Review{
+		RepoFullName: "codepilot/dev-sample",
+		PRNumber:     9999,
+		PRTitle:      "Critical test PR: unsafe config and auth bypass",
+		PRAuthor:     "codepilot-bot",
+		PRUrl:        "https://example.com/codepilot/dev-sample/pull/9999",
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	issues := []db.ReviewIssue{
+		{
+			FilePath:    "backend/internal/auth/session.go",
+			LineStart:   42,
+			LineEnd:     68,
+			Severity:    "critical",
+			Category:    "security",
+			Title:       "Auth bypass in session validation",
+			Description: "Session validation accepts unsigned or expired tokens, allowing unauthorized access to protected endpoints.",
+			Suggestion:  "Reject invalid signatures and expired tokens before creating an authenticated session.",
+		},
+		{
+			FilePath:    "backend/internal/api/router.go",
+			LineStart:   180,
+			LineEnd:     210,
+			Severity:    "critical",
+			Category:    "bug",
+			Title:       "Unbounded retry loop on failing requests",
+			Description: "The request path retries indefinitely when upstream calls fail, which can saturate the worker and keep the PR stuck in processing.",
+			Suggestion:  "Cap retries and fail fast after a small number of attempts.",
+		},
+	}
+
+	if err := h.db.UpdateReviewStatus(review.ID, "done", "critical", "Synthetic critical review created for testing. This PR is intentionally marked critical so you can exercise the UI, notifications, and review detail flow.", len(issues), `[{"ts":"`+time.Now().UTC().Format(time.RFC3339)+`","action":"seed","detail":"synthetic critical review generated"}]`); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.db.InsertIssues(review.ID, issues); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"review_id": review.ID,
+		"status":    "seeded",
+		"severity":  "critical",
+	})
 }
 
 // ─── Analytics ────────────────────────────────────────────────────────────────

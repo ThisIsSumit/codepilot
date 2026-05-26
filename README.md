@@ -7,7 +7,7 @@
 ## Architecture
 
 ```
-GitHub Webhook → Go (Gin) → Redis Queue → Worker → Gemini Agent (Tool Use)
+GitHub Webhook → Go (Gin) → Redis Queue → Worker → OpenRouter Agent (Tool Use)
                                                           ↓
                                               PostgreSQL (reviews, issues)
                                                           ↓
@@ -19,7 +19,7 @@ GitHub Webhook → Go (Gin) → Redis Queue → Worker → Gemini Agent (Tool Us
 | Layer | Tech |
 |---|---|
 | Backend | Go 1.22, Gin, lib/pq, go-redis |
-| AI Agent | Gemini 3 Flash Preview (tool use: read_pr_diff, report_issues, post_github_comment) |
+| AI Agent | OpenRouter SDK (tool use: read_pr_diff, report_issues, post_github_comment) |
 | Queue | Redis (reliable BRPOPLPUSH pattern) |
 | Database | PostgreSQL 16 (reviews, issues, repos) |
 | Frontend | Next.js 14 App Router, Recharts, SWR |
@@ -34,7 +34,7 @@ GitHub Webhook → Go (Gin) → Redis Queue → Worker → Gemini Agent (Tool Us
 - Go 1.22+
 - Node.js 20+
 - Docker + Docker Compose
-- Gemini API key
+- OpenRouter API key
 - GitHub Personal Access Token (or GitHub App)
 
 ### 1. Start infrastructure
@@ -48,7 +48,7 @@ docker compose up postgres redis -d
 ```bash
 cd backend
 cp .env.example .env
-# Fill in GEMINI_API_KEY, GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET
+# Fill in OPENROUTER_API_KEY, OPENROUTER_MODEL, GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET
 
 go mod download
 go run ./cmd/server
@@ -122,7 +122,7 @@ curl -X POST http://localhost:8080/api/v1/reviews/trigger \
 
 ---
 
-## Gemini Agent Tools
+## OpenRouter Agent Tools
 
 The agent runs an autonomous loop with three tools:
 
@@ -147,7 +147,7 @@ railway init
 railway up --service backend
 ```
 
-Set env vars in Railway dashboard: `DATABASE_URL`, `REDIS_URL`, `GEMINI_API_KEY`, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`
+Set env vars in Railway dashboard: `DATABASE_URL`, `REDIS_URL`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`
 
 If you want email or Slack notifications to actually send, also set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, and `SLACK_WEBHOOK_URL`.
 
@@ -175,7 +175,7 @@ Set `NEXT_PUBLIC_API_URL` to your Railway backend URL.
 
 ## Resume Bullets
 
-- **Built an autonomous AI code reviewer** using Gemini tool-use (gemini-3-flash-preview) that reads PR diffs, detects bugs/security issues, and posts structured GitHub reviews with zero human intervention
+- **Built an autonomous AI code reviewer** using OpenRouter tool-use that reads PR diffs, detects bugs/security issues, and posts structured GitHub reviews with zero human intervention
 - **Engineered Go webhook server** (Gin + Redis BRPOPLPUSH reliable queue) handling concurrent PR analysis workloads with graceful shutdown and context cancellation
 - **Designed agentic tool-use loop** with three domain tools — diff fetcher, structured issue reporter, GitHub comment poster — demonstrating multi-step AI orchestration
 - **Built real-time Next.js 14 dashboard** with App Router, SWR polling, Recharts analytics, and Stitch precision-instrument design system
@@ -190,7 +190,7 @@ codepilot/
 ├── backend/
 │   ├── cmd/server/main.go          ← Entrypoint, graceful shutdown
 │   ├── internal/
-│   │   ├── agent/agent.go          ← Gemini tool-use loop
+│   │   ├── agent/agent.go          ← OpenRouter tool-use loop
 │   │   ├── github/github.go        ← Webhook validation, diff fetcher, comment poster
 │   │   ├── queue/queue.go          ← Redis BRPOPLPUSH queue
 │   │   ├── queue/worker.go         ← Background worker goroutine

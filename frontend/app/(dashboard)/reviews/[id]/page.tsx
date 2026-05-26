@@ -1,6 +1,4 @@
-'use client'
-
-import { use } from 'react'
+"use client"
 import useSWR from 'swr'
 import Link from 'next/link'
 import { swrFetcher } from '@/lib/api'
@@ -11,11 +9,11 @@ import { IssueCard } from '@/components/reviews/IssueCard'
 import { Skeleton, EmptyState } from '@/components/ui/Card'
 
 interface Props {
-  params: Promise<{ id: string }>
+  params: { id: string }
 }
 
 export default function ReviewDetailPage({ params }: Props) {
-  const { id } = use(params)
+  const { id } = params
 
   const { data: review, isLoading: reviewLoading } = useSWR<Review>(
     `/api/v1/reviews/${id}`,
