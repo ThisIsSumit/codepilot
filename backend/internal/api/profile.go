@@ -49,7 +49,7 @@ func (h *Handler) getProfile(c *gin.Context) {
 		return
 	}
 
-	stats, err := h.profileStats()
+	stats, err := h.profileStats(user)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "stats unavailable"})
 		return
@@ -187,13 +187,21 @@ func (h *Handler) mustAuthUser(c *gin.Context) *db.User {
 	return nil
 }
 
-func (h *Handler) profileStats() (profileStats, error) {
-	stats, err := h.db.GetStats()
+func (h *Handler) profileStats(user *db.User) (profileStats, error) {
+	if user == nil {
+		return profileStats{}, nil
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		return profileStats{}, nil
+	}
+
+	stats, err := h.db.GetStatsByOwner(owner)
 	if err != nil {
 		return profileStats{}, err
 	}
 
-	repos, err := h.db.ListRepositories()
+	repos, err := h.db.ListRepositoriesByOwner(owner)
 	if err != nil {
 		return profileStats{}, err
 	}

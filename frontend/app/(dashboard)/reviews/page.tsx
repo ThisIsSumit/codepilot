@@ -3,7 +3,7 @@
 import useSWR from 'swr'
 import Link from 'next/link'
 import { swrFetcher } from '@/lib/api'
-import type { ListReviewsResponse } from '@/lib/types'
+import type { ListReviewsResponse, ProfileResponse } from '@/lib/types'
 import { SeverityBadge, StatusBadge } from '@/components/ui/Badge'
 import { PageHeader, SkeletonRow, EmptyState } from '@/components/ui/Card'
 
@@ -18,8 +18,9 @@ function timeAgo(dateStr: string): string {
 }
 
 export default function ReviewsPage() {
+  const { data: profile } = useSWR<ProfileResponse>('/api/v1/me', swrFetcher)
   const { data, isLoading, error } = useSWR<ListReviewsResponse>(
-    '/api/v1/reviews?limit=100',
+    profile?.user?.id ? `/api/v1/reviews?limit=100&scope=${profile.user.id}` : null,
     swrFetcher,
     { refreshInterval: 6000 }
   )

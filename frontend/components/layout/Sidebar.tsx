@@ -66,6 +66,8 @@ export function Sidebar() {
     try {
       await signOut()
       router.replace('/signin')
+      // refresh server-rendered state so layout/auth checks run again
+      router.refresh()
     } finally {
       setLoggingOut(false)
     }

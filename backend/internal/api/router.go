@@ -179,7 +179,18 @@ func (h *Handler) handlePREvent(c *gin.Context, body []byte) {
 // ─── Repos ────────────────────────────────────────────────────────────────────
 
 func (h *Handler) listRepos(c *gin.Context) {
-	repos, err := h.db.ListRepositories()
+	user := h.mustAuthUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		c.JSON(http.StatusOK, gin.H{"repositories": []db.Repository{}, "count": 0})
+		return
+	}
+
+	repos, err := h.db.ListRepositoriesByOwner(owner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -193,13 +204,24 @@ func (h *Handler) listRepos(c *gin.Context) {
 // ─── Reviews ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) listReviews(c *gin.Context) {
+	user := h.mustAuthUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		c.JSON(http.StatusOK, gin.H{"reviews": []db.Review{}, "count": 0})
+		return
+	}
+
 	limit := 50
 	if l := c.Query("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
 			limit = n
 		}
 	}
-	reviews, err := h.db.ListReviews(limit)
+	reviews, err := h.db.ListReviewsByOwner(limit, owner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -211,12 +233,23 @@ func (h *Handler) listReviews(c *gin.Context) {
 }
 
 func (h *Handler) getReview(c *gin.Context) {
+	user := h.mustAuthUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
 		return
 	}
-	review, err := h.db.GetReview(id)
+	review, err := h.db.GetReviewByOwner(id, owner)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
@@ -225,12 +258,23 @@ func (h *Handler) getReview(c *gin.Context) {
 }
 
 func (h *Handler) getReviewIssues(c *gin.Context) {
+	user := h.mustAuthUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		c.JSON(http.StatusOK, gin.H{"issues": []db.ReviewIssue{}, "count": 0})
+		return
+	}
+
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
 		return
 	}
-	issues, err := h.db.GetIssuesByReview(id)
+	issues, err := h.db.GetIssuesByReviewAndOwner(id, owner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -253,6 +297,15 @@ func (h *Handler) triggerReview(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	owner, repo, err := gh.ParseParts(body.RepoFullName)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_full_name"})
+		return
+	}
+	if _, err := h.db.UpsertRepository(owner, repo, 0); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -292,13 +345,18 @@ func (h *Handler) seedCriticalReview(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "disabled in production"})
 		return
 	}
+	owner := "codepilot-demo"
+	if _, err := h.db.UpsertRepository(owner, "dev-sample", 0); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	review, err := h.db.UpsertReview(&db.Review{
-		RepoFullName: "codepilot/dev-sample",
+		RepoFullName: owner + "/dev-sample",
 		PRNumber:     9999,
 		PRTitle:      "Critical test PR: unsafe config and auth bypass",
 		PRAuthor:     "codepilot-bot",
-		PRUrl:        "https://example.com/codepilot/dev-sample/pull/9999",
+		PRUrl:        "https://example.com/" + owner + "/dev-sample/pull/9999",
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -348,7 +406,18 @@ func (h *Handler) seedCriticalReview(c *gin.Context) {
 // ─── Analytics ────────────────────────────────────────────────────────────────
 
 func (h *Handler) getStats(c *gin.Context) {
-	stats, err := h.db.GetStats()
+	user := h.mustAuthUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	owner := strings.TrimSpace(user.GitHubUsername)
+	if owner == "" {
+		c.JSON(http.StatusOK, gin.H{"total_reviews": 0, "completed": 0, "failed": 0, "critical_prs": 0, "severity_breakdown": map[string]int{}, "activity": []interface{}{}})
+		return
+	}
+
+	stats, err := h.db.GetStatsByOwner(owner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

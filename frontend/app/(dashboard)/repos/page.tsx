@@ -2,12 +2,12 @@
 
 import useSWR from 'swr'
 import { swrFetcher } from '@/lib/api'
-import type { ListReposResponse, ListReviewsResponse } from '@/lib/types'
+import type { ListReposResponse, ListReviewsResponse, ProfileResponse } from '@/lib/types'
 import { PageHeader, EmptyState, Skeleton } from '@/components/ui/Card'
 
-function RepoCard({ repo }: { repo: { owner: string; name: string; full_name: string; created_at: string } }) {
+function RepoCard({ repo, cacheScope }: { repo: { owner: string; name: string; full_name: string; created_at: string }; cacheScope: string }) {
   const { data: reviewsData } = useSWR<ListReviewsResponse>(
-    `/api/v1/reviews?limit=100`,
+    `/api/v1/reviews?limit=100&scope=${cacheScope}`,
     swrFetcher,
     { refreshInterval: 30000 }
   )
@@ -116,13 +116,15 @@ function RepoCard({ repo }: { repo: { owner: string; name: string; full_name: st
 }
 
 export default function ReposPage() {
+  const { data: profile } = useSWR<ProfileResponse>('/api/v1/me', swrFetcher)
   const { data, isLoading, error } = useSWR<ListReposResponse>(
-    '/api/v1/repos',
+    profile?.user?.id ? `/api/v1/repos?scope=${profile.user.id}` : null,
     swrFetcher,
     { refreshInterval: 30000 }
   )
 
   const repos = data?.repositories ?? []
+  const cacheScope = String(profile?.user?.id ?? 'anonymous')
 
   return (
     <div style={{ minHeight: '100vh' }}>
@@ -160,7 +162,7 @@ export default function ReposPage() {
         {repos.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '16px' }}>
             {repos.map((repo) => (
-              <RepoCard key={repo.id} repo={repo} />
+              <RepoCard key={repo.id} repo={repo} cacheScope={cacheScope} />
             ))}
           </div>
         )}

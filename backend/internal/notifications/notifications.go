@@ -58,6 +58,11 @@ func (s *Service) NotifyReviewCompleted(ctx context.Context, reviewID int) {
 		log.Printf("notifications: load review %d failed: %v", reviewID, err)
 		return
 	}
+	repo, err := s.db.GetRepositoryByFullName(review.RepoFullName)
+	if err != nil {
+		log.Printf("notifications: load repo for review %d failed: %v", reviewID, err)
+		return
+	}
 
 	issues, err := s.db.GetIssuesByReview(reviewID)
 	if err != nil {
@@ -73,6 +78,9 @@ func (s *Service) NotifyReviewCompleted(ctx context.Context, reviewID int) {
 
 	message := buildReviewMessage(review, len(issues))
 	for _, user := range users {
+		if strings.TrimSpace(user.GitHubUsername) != strings.TrimSpace(repo.Owner) {
+			continue
+		}
 		if user.NotificationEmail {
 			if err := s.sendEmail(ctx, user.Email, message.subject, message.body); err != nil {
 				log.Printf("notifications: email to %s failed: %v", user.Email, err)
@@ -93,25 +101,19 @@ func (s *Service) SendWeeklyDigest(ctx context.Context) {
 		return
 	}
 
-	items, err := s.collectWeeklyDigestItems()
-	if err != nil {
-		log.Printf("notifications: load reviews for digest failed: %v", err)
-		return
-	}
-	if len(items) == 0 {
-		return
-	}
-
-	body := buildWeeklyDigestBody(items)
-	s.deliverWeeklyDigest(ctx, users, body)
+	s.deliverWeeklyDigest(ctx, users)
 }
 
 func (s *Service) loadUsersForDigest() ([]db.User, error) {
 	return s.db.ListUsers()
 }
 
-func (s *Service) collectWeeklyDigestItems() ([]reviewDigestItem, error) {
-	reviews, err := s.db.ListReviews(100)
+func (s *Service) collectWeeklyDigestItems(owner string) ([]reviewDigestItem, error) {
+	if strings.TrimSpace(owner) == "" {
+		return []reviewDigestItem{}, nil
+	}
+
+	reviews, err := s.db.ListReviewsByOwner(100, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +137,22 @@ func (s *Service) collectWeeklyDigestItems() ([]reviewDigestItem, error) {
 	return items, nil
 }
 
-func (s *Service) deliverWeeklyDigest(ctx context.Context, users []db.User, body string) {
+func (s *Service) deliverWeeklyDigest(ctx context.Context, users []db.User) {
 	for _, user := range users {
 		if !user.NotificationWeeklyDigest {
 			continue
 		}
+		owner := strings.TrimSpace(user.GitHubUsername)
+		items, err := s.collectWeeklyDigestItems(owner)
+		if err != nil {
+			log.Printf("notifications: load reviews for digest failed for user %d: %v", user.ID, err)
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+
+		body := buildWeeklyDigestBody(items)
 		if user.NotificationEmail {
 			if err := s.sendEmail(ctx, user.Email, "Your weekly CodePilot digest", body); err != nil {
 				log.Printf("notifications: digest email to %s failed: %v", user.Email, err)

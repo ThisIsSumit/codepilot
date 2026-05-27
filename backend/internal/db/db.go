@@ -371,6 +371,42 @@ func (d *DB) ListRepositories() ([]Repository, error) {
 	return repos, rows.Err()
 }
 
+func (d *DB) ListRepositoriesByOwner(owner string) ([]Repository, error) {
+	rows, err := d.Query(`
+		SELECT id, owner, name, full_name, install_id, active, created_at
+		FROM repositories
+		WHERE active = true AND owner = $1
+		ORDER BY created_at DESC
+	`, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []Repository
+	for rows.Next() {
+		var r Repository
+		if err := rows.Scan(&r.ID, &r.Owner, &r.Name, &r.FullName, &r.InstallID, &r.Active, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		repos = append(repos, r)
+	}
+	return repos, rows.Err()
+}
+
+func (d *DB) GetRepositoryByFullName(fullName string) (*Repository, error) {
+	row := d.QueryRow(`
+		SELECT id, owner, name, full_name, install_id, active, created_at
+		FROM repositories WHERE full_name = $1
+	`, fullName)
+
+	var r Repository
+	if err := row.Scan(&r.ID, &r.Owner, &r.Name, &r.FullName, &r.InstallID, &r.Active, &r.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // ─── Review ──────────────────────────────────────────────────────────────────
 
 type Review struct {
@@ -446,6 +482,37 @@ func (d *DB) ListReviews(limit int) ([]Review, error) {
 	return reviews, rows.Err()
 }
 
+func (d *DB) ListReviewsByOwner(limit int, owner string) ([]Review, error) {
+	rows, err := d.Query(`
+		SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.pr_title, rv.pr_author, rv.pr_url,
+		       rv.status, rv.severity, COALESCE(rv.summary,''), rv.issues_count, rv.agent_log::text, rv.created_at, rv.updated_at
+		FROM reviews rv
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE r.active = true AND r.owner = $2
+		ORDER BY rv.created_at DESC
+		LIMIT $1
+	`, limit, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reviews []Review
+	for rows.Next() {
+		var r Review
+		var logStr string
+		err := rows.Scan(&r.ID, &r.RepoFullName, &r.PRNumber, &r.PRTitle, &r.PRAuthor,
+			&r.PRUrl, &r.Status, &r.Severity, &r.Summary, &r.IssuesCount, &logStr,
+			&r.CreatedAt, &r.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		r.AgentLog = parseAgentLog(logStr)
+		reviews = append(reviews, r)
+	}
+	return reviews, rows.Err()
+}
+
 func (d *DB) ListFailedReviews(limit int) ([]Review, error) {
 	rows, err := d.Query(`
 		SELECT id, repo_full_name, pr_number, pr_title, pr_author, pr_url,
@@ -482,6 +549,17 @@ func (d *DB) GetReview(id int) (*Review, error) {
 		       status, severity, COALESCE(summary,''), issues_count, agent_log::text, created_at, updated_at
 		FROM reviews WHERE id=$1
 	`, id)
+	return scanReview(row, "")
+}
+
+func (d *DB) GetReviewByOwner(id int, owner string) (*Review, error) {
+	row := d.QueryRow(`
+		SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.pr_title, rv.pr_author, rv.pr_url,
+		       rv.status, rv.severity, COALESCE(rv.summary,''), rv.issues_count, rv.agent_log::text, rv.created_at, rv.updated_at
+		FROM reviews rv
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE rv.id = $1 AND r.active = true AND r.owner = $2
+	`, id, owner)
 	return scanReview(row, "")
 }
 
@@ -524,6 +602,71 @@ func (d *DB) GetStats() (map[string]interface{}, error) {
 		GROUP BY DATE(created_at)
 		ORDER BY DATE(created_at)
 	`)
+	if err == nil {
+		defer actRows.Close()
+		type dataPoint struct {
+			Date  string `json:"date"`
+			Count int    `json:"count"`
+		}
+		var activity []dataPoint
+		for actRows.Next() {
+			var dp dataPoint
+			actRows.Scan(&dp.Date, &dp.Count)
+			activity = append(activity, dp)
+		}
+		stats["activity"] = activity
+	}
+
+	return stats, nil
+}
+
+func (d *DB) GetStatsByOwner(owner string) (map[string]interface{}, error) {
+	stats := make(map[string]interface{})
+
+	countQuery := `
+		SELECT COUNT(*)
+		FROM reviews rv
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE r.active = true AND r.owner = $1
+	`
+	var total, done, failed, critical int
+	d.QueryRow(countQuery, owner).Scan(&total)
+	d.QueryRow(countQuery+" AND rv.status='done'", owner).Scan(&done)
+	d.QueryRow(countQuery+" AND rv.status='failed'", owner).Scan(&failed)
+	d.QueryRow(countQuery+" AND rv.severity='critical'", owner).Scan(&critical)
+
+	stats["total_reviews"] = total
+	stats["completed"] = done
+	stats["failed"] = failed
+	stats["critical_prs"] = critical
+
+	rows, err := d.Query(`
+		SELECT rv.severity, COUNT(*)
+		FROM reviews rv
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE r.active = true AND r.owner = $1 AND rv.status = 'done'
+		GROUP BY rv.severity
+	`, owner)
+	if err == nil {
+		defer rows.Close()
+		breakdown := make(map[string]int)
+		for rows.Next() {
+			var sev string
+			var cnt int
+			rows.Scan(&sev, &cnt)
+			breakdown[sev] = cnt
+		}
+		stats["severity_breakdown"] = breakdown
+	}
+
+	actRows, err := d.Query(`
+		SELECT DATE(rv.created_at), COUNT(*)
+		FROM reviews rv
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE r.active = true AND r.owner = $1 AND rv.created_at > NOW() - INTERVAL '7 days'
+		GROUP BY DATE(rv.created_at)
+		ORDER BY DATE(rv.created_at)
+	`, owner)
 	if err == nil {
 		defer actRows.Close()
 		type dataPoint struct {
@@ -589,6 +732,33 @@ func (d *DB) GetIssuesByReview(reviewID int) ([]ReviewIssue, error) {
 		       severity, category, title, description, COALESCE(suggestion,'')
 		FROM review_issues WHERE review_id=$1 ORDER BY severity DESC, file_path
 	`, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var issues []ReviewIssue
+	for rows.Next() {
+		var i ReviewIssue
+		if err := rows.Scan(&i.ID, &i.ReviewID, &i.FilePath, &i.LineStart, &i.LineEnd,
+			&i.Severity, &i.Category, &i.Title, &i.Description, &i.Suggestion); err != nil {
+			return nil, err
+		}
+		issues = append(issues, i)
+	}
+	return issues, rows.Err()
+}
+
+func (d *DB) GetIssuesByReviewAndOwner(reviewID int, owner string) ([]ReviewIssue, error) {
+	rows, err := d.Query(`
+		SELECT i.id, i.review_id, i.file_path, COALESCE(i.line_start,0), COALESCE(i.line_end,0),
+		       i.severity, i.category, i.title, i.description, COALESCE(i.suggestion,'')
+		FROM review_issues i
+		JOIN reviews rv ON rv.id = i.review_id
+		JOIN repositories r ON r.full_name = rv.repo_full_name
+		WHERE i.review_id = $1 AND r.active = true AND r.owner = $2
+		ORDER BY i.severity DESC, i.file_path
+	`, reviewID, owner)
 	if err != nil {
 		return nil, err
 	}

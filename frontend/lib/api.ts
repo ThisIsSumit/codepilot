@@ -19,6 +19,7 @@ const BASE =
 async function fetcher<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     credentials: 'include',
+    cache: 'no-store',
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
   })
@@ -98,7 +99,7 @@ export const api = {
 
 // SWR fetcher — returns just the data (SWR passes the key as URL)
 export const swrFetcher = (key: string) =>
-  fetch(`${BASE}${key}`, { credentials: 'include' }).then((r) => {
+  fetch(`${BASE}${key}`, { credentials: 'include', cache: 'no-store' }).then((r) => {
     if (!r.ok) throw new Error('fetch error')
     return r.json()
   })

@@ -25,7 +25,9 @@ export function DangerZoneSection({ isLoading, onStatus }: Readonly<DangerZoneSe
     try {
       await api.deleteAccount(deleteConfirm.trim())
       await signOut()
-      router.replace('/signin')
+      await router.replace('/signin')
+      // ensure server components re-run and show signed-out state
+      router.refresh()
     } catch (err) {
       onStatus(err instanceof Error ? err.message : 'Could not delete account')
     } finally {
