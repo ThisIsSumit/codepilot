@@ -12,7 +12,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Request CODEOWNERS reviewer via API
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -26,7 +26,7 @@ jobs:
                 pull_number: pr.number,
                 reviewers,
               });
-              core.info(`Requested reviewers: ${reviewers.join(', ')}`);
+              console.log(`Requested reviewers: ${reviewers.join(', ')}`);
             } catch (err) {
-              core.warning('Failed to request reviewers: ' + err.message);
+              console.warn('Failed to request reviewers: ' + err.message);
             }
