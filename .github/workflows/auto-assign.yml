@@ -1,0 +1,32 @@
+name: Auto-request reviewers
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  request-reviewers:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Request CODEOWNERS reviewer via API
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+            // List of reviewers to request. Update as needed.
+            const reviewers = ['ThisIsSumit'];
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                reviewers,
+              });
+              core.info(`Requested reviewers: ${reviewers.join(', ')}`);
+            } catch (err) {
+              core.warning('Failed to request reviewers: ' + err.message);
+            }
