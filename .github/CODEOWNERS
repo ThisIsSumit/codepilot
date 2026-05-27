@@ -5,19 +5,20 @@
 # Backend code ownership
 /backend/ @your-org/backend-team @ThisIsSumit
 
-# Frontend code ownership
-/frontend/ @your-org/frontend-team @ThisIsSumit
+
+# Backend code ownership — replace with one or more GitHub usernames
+/backend/ @ThisIsSumit
+
+# Frontend code ownership — replace with one or more GitHub usernames
+/frontend/ @ThisIsSumit
 
 # API / internal packages
-/internal/ @your-org/backend-team @ThisIsSumit
+/internal/ @ThisIsSumit
 
 # Docs and repo-level files
 /README.md @ThisIsSumit
 /.github/ @ThisIsSumit
 
-# Default owner for everything else — replace with a team or user
+# Default owner for everything else — replace with one or more users
 * @ThisIsSumit
-
-# Useful examples (uncomment and edit as needed):
-# /docs/ @docs-team
 # *.md @docs-team
