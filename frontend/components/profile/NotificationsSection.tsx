@@ -1,3 +1,5 @@
+'use client'
+
 import { useState } from 'react'
 import { api } from '@/lib/api'
 import type { ProfileResponse } from '@/lib/types'
