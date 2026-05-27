@@ -1,0 +1,23 @@
+# CODEOWNERS — automatically request reviewers for changed paths
+# Replace the placeholder usernames and team names (example: @org/team or @username)
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Backend code ownership
+/backend/ @your-org/backend-team @ThisIsSumit
+
+# Frontend code ownership
+/frontend/ @your-org/frontend-team @ThisIsSumit
+
+# API / internal packages
+/internal/ @your-org/backend-team @ThisIsSumit
+
+# Docs and repo-level files
+/README.md @ThisIsSumit
+/.github/ @ThisIsSumit
+
+# Default owner for everything else — replace with a team or user
+* @ThisIsSumit
+
+# Useful examples (uncomment and edit as needed):
+# /docs/ @docs-team
+# *.md @docs-team
