@@ -13,7 +13,8 @@ export default function RootLayout({
   children,
 }: {
   readonly children: React.ReactNode
-}) {
+}) 
+{
   const cookieStore = cookies()
   const initialAuthenticated = hasAuthCookie(cookieStore)
 
